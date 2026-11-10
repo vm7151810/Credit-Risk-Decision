@@ -17,12 +17,13 @@ Build a simple end-to-end system that:
 
 The project is built with:
 
+- **Streamlit** for interactive credit decisioning and review dashboard
 - **FastAPI** for serving predictions through an API
 - **Logistic Regression** for credit risk scoring
 - **SHAP** for model explanation
+- **Google Gemini API** (`gemini-3.8-flash`, `gemini-3.5-flash-lite`, `gemini-2.5-flash`) for multi-model fallback cascade in review guidance and plain-language explanation
+- **LangChain + Chroma + Gemini embeddings** for review-only analyst guidance
 - **n8n** for workflow automation
-- **Ollama** for rewriting technical explanations into plain language
-- **LangChain + Chroma + Ollama embeddings** for review-only analyst guidance
 - **Google Sheets** for decision logging
 - **Gmail** and **Slack** for summary notifications
 
@@ -59,8 +60,8 @@ SHAP identifies which features pushed the model prediction up or down. Ollama th
 ### 6. Review-only RAG layer
 For `Review` cases, a separate vector retrieval layer extracts and embeds
 page-level text from official European consumer-credit PDFs with
-`nomic-embed-text`, stores it in Chroma, and uses retrieved passages to
-generate a sourced reviewer note. Citations include the issuing authority,
+`gemini-embedding-001`, stores it in Chroma, and uses retrieved passages to
+generate a sourced reviewer note with Google Gemini. Citations include the issuing authority,
 document title, page number, and official source URL. This layer does not
 score risk and does not replace the logistic regression model.
 
@@ -193,11 +194,39 @@ Install Python dependencies:
 python -m pip install -r requirements.txt
 ```
 
+Configure `.env`:
+```bash
+cp .env.example .env
+# Set GEMINI_API_KEY=your_key in .env
+```
+
 Run the API:
 
 ```powershell
 python -m uvicorn main:app --reload
 ```
+
+Run the Streamlit Dashboard:
+
+```powershell
+streamlit run app.py
+```
+
+### Deploying to Streamlit Community Cloud
+
+The app includes an **in-process engine fallback**, allowing it to run fully self-contained on [Streamlit Community Cloud](https://share.streamlit.io) without requiring a separate backend server:
+
+1. Push your repository to GitHub.
+2. Sign in to [share.streamlit.io](https://share.streamlit.io) with your GitHub account.
+3. Click **Create app** and select:
+   - **Repository:** `vm7151810/Credit-Risk-Decision`
+   - **Branch:** `main`
+   - **Main file path:** `app.py`
+4. Expand **Advanced settings** -> **Secrets** and enter:
+   ```toml
+   GEMINI_API_KEY = "your_actual_gemini_api_key_here"
+   ```
+5. Click **Deploy!**
 
 Install the local Ollama models used for generation and retrieval:
 

@@ -12,3 +12,5 @@ pypdf
 google-genai>=2.25.0
 python-dotenv
 streamlit
+requests
+httpx
