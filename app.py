@@ -55,6 +55,36 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# In-Process Client Fallback for Zero-Config Cloud Deployments (Streamlit Community Cloud)
+@st.cache_resource
+def get_in_process_client():
+    try:
+        from fastapi.testclient import TestClient
+        from main import app as backend_app
+        client = TestClient(backend_app)
+        client.__enter__()
+        return client
+    except Exception:
+        return None
+
+def api_get(url: str, endpoint: str, timeout: int = 5):
+    try:
+        return requests.get(f"{url.rstrip('/')}{endpoint}", timeout=timeout)
+    except requests.exceptions.ConnectionError:
+        in_proc = get_in_process_client()
+        if in_proc is not None:
+            return in_proc.get(endpoint)
+        raise
+
+def api_post(url: str, endpoint: str, json: dict, timeout: int = 120):
+    try:
+        return requests.post(f"{url.rstrip('/')}{endpoint}", json=json, timeout=timeout)
+    except requests.exceptions.ConnectionError:
+        in_proc = get_in_process_client()
+        if in_proc is not None:
+            return in_proc.post(endpoint, json=json)
+        raise
+
 # Benchmark Preset Profiles
 PRESETS = {
     "Approved Borrower Profile": {
@@ -220,15 +250,17 @@ with st.sidebar:
     api_url = st.text_input(
         "API Base URL",
         value=os.getenv("CREDIT_API_URL", "http://localhost:8000"),
-        help="FastAPI backend URL. Defaults to localhost:8000.",
+        help="FastAPI backend URL. If not running, automatically executes via in-process engine.",
     )
 
     # Health check
     try:
-        health_resp = requests.get(f"{api_url.rstrip('/')}/health", timeout=2)
+        health_resp = api_get(api_url, "/health", timeout=2)
         if health_resp.status_code == 200:
             health_data = health_resp.json()
-            st.success("● API Online & Connected")
+            is_in_proc = "testclient" in str(type(health_resp)).lower()
+            status_desc = "Cloud In-Process" if is_in_proc else "API Connected"
+            st.success(f"● Engine Online ({status_desc})")
             st.caption(
                 f"**Scoring Model:** `{health_data.get('model', 'logistic_regression')}`\n\n"
                 f"**Policy Version:** `{health_data.get('policy_version', 'standard')}`"
@@ -236,8 +268,8 @@ with st.sidebar:
         else:
             st.warning(f"API returned status {health_resp.status_code}")
     except Exception:
-        st.error("● API Offline (Cannot connect to backend)")
-        st.info("Start the API with:\n```bash\npython3 -m uvicorn main:app --reload\n```")
+        st.error("● Engine Offline")
+        st.info("Start the API locally with:\n```bash\npython3 -m uvicorn main:app --reload\n```")
 
     st.markdown("---")
     st.subheader("Benchmark Presets")
@@ -474,7 +506,7 @@ if submitted:
 
     try:
         with st.spinner("Scoring borrower profile & computing SHAP feature contributions..."):
-            resp = requests.post(f"{api_url.rstrip('/')}/predict", json=payload, timeout=10)
+            resp = api_post(api_url, "/predict", json=payload, timeout=10)
 
         if resp.status_code != 200:
             st.error(f"API Error ({resp.status_code}): {resp.text}")
@@ -557,11 +589,7 @@ if submitted:
                         "applicant": payload,
                         "prediction": prediction,
                     }
-                    review_resp = requests.post(
-                        f"{api_url.rstrip('/')}/review-summary",
-                        json=review_payload,
-                        timeout=120,
-                    )
+                    review_resp = api_post(api_url, "/review-summary", json=review_payload, timeout=120)
 
                 if review_resp.status_code == 200:
                     review_data = review_resp.json()
@@ -611,7 +639,7 @@ if submitted:
                     st.warning(
                         f"Regulatory Review Guidance unavailable (HTTP {review_resp.status_code}):\n\n"
                         f"{review_resp.text}\n\n"
-                        "*(Ensure GEMINI_API_KEY is configured in your `.env` file)*"
+                        "*(Ensure GEMINI_API_KEY is configured in your `.env` file or Streamlit Secrets)*"
                     )
 
     except requests.exceptions.ConnectionError:
