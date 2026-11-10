@@ -455,6 +455,17 @@ app = FastAPI(
 )
 
 
+@app.get("/")
+def root() -> dict[str, str]:
+    return {
+        "service": "Credit Risk Decision API",
+        "status": "online",
+        "documentation": "/docs",
+        "health": "/health",
+        "frontend": "http://localhost:8501",
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     artifacts = app.state.artifacts

@@ -2,13 +2,148 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import socket
 from typing import Any
 
+from dotenv import load_dotenv
 
-DEFAULT_REVIEW_MODEL = "gemma3:4b"
-DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+load_dotenv()
+
+# Prioritize IPv4 resolution to prevent connect timeouts on systems without active IPv6 routes
+try:
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if family == 0:
+            family = socket.AF_INET
+        return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_first_getaddrinfo
+except Exception:
+    pass
+
+
+GEMINI_FLASH_CASCADE = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
+
+DEFAULT_REVIEW_MODEL = GEMINI_FLASH_CASCADE[0]
+DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 RETRIEVAL_POLICY_VERSION = "official-eu-credit-guidance-v1.0"
+
+
+class GeminiEmbeddings:
+    """Vector embeddings using the official Google GenAI Gemini API."""
+
+    def __init__(
+        self,
+        model: str = DEFAULT_EMBEDDING_MODEL,
+        api_key: str | None = None,
+    ) -> None:
+        self.model = model
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        self._client: Any = None
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            if not self.api_key:
+                self.api_key = os.getenv("GEMINI_API_KEY", "")
+            if not self.api_key:
+                raise RuntimeError(
+                    "GEMINI_API_KEY is not set. Please set GEMINI_API_KEY in your .env file or environment."
+                )
+            from google import genai
+            from google.genai import types
+
+            self._client = genai.Client(
+                api_key=self.api_key,
+                http_options=types.HttpOptions(timeout=30000),
+            )
+        return self._client
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        client = self._get_client()
+        all_embeddings: list[list[float]] = []
+        batch_size = 50
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            resp = client.models.embed_content(
+                model=self.model,
+                contents=batch,
+            )
+            for emb in resp.embeddings:
+                all_embeddings.append(emb.values)
+        return all_embeddings
+
+    def embed_query(self, text: str) -> list[float]:
+        client = self._get_client()
+        resp = client.models.embed_content(
+            model=self.model,
+            contents=text,
+        )
+        if hasattr(resp, "embedding") and resp.embedding:
+            return resp.embedding.values
+        return resp.embeddings[0].values
+
+
+class GeminiCascadeLLM:
+    """Multi-Model Instant Fallback Cascade for Gemini text generation."""
+
+    def __init__(
+        self,
+        models: list[str] | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self.models = list(models) if models else list(GEMINI_FLASH_CASCADE)
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        self.model_name = self.models[0]
+        self._client: Any = None
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            if not self.api_key:
+                self.api_key = os.getenv("GEMINI_API_KEY", "")
+            if not self.api_key:
+                raise RuntimeError(
+                    "GEMINI_API_KEY is not set. Please set GEMINI_API_KEY in your .env file or environment."
+                )
+            from google import genai
+            from google.genai import types
+
+            self._client = genai.Client(
+                api_key=self.api_key,
+                http_options=types.HttpOptions(timeout=20000),
+            )
+        return self._client
+
+    def invoke(self, prompt: str) -> str:
+        client = self._get_client()
+        from google.genai import errors
+
+        last_error = None
+        for model in self.models:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+                if response and response.text:
+                    self.model_name = model
+                    return response.text
+            except (errors.APIError, Exception) as exc:
+                last_error = exc
+                continue
+
+        raise RuntimeError(
+            f"All Gemini models in fallback cascade failed. Attempted models: {self.models}. Last error: {last_error}"
+        )
 
 
 class ReviewRAGService:
@@ -16,12 +151,17 @@ class ReviewRAGService:
         self,
         knowledge_base_dir: Path,
         vector_store_dir: Path,
-        model_name: str = DEFAULT_REVIEW_MODEL,
+        model_name: str | list[str] = DEFAULT_REVIEW_MODEL,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ) -> None:
         self.knowledge_base_dir = knowledge_base_dir
         self.vector_store_dir = vector_store_dir
-        self.model_name = model_name
+        if isinstance(model_name, list):
+            self.model_names = list(model_name)
+            self.model_name = model_name[0]
+        else:
+            self.model_names = [model_name]
+            self.model_name = model_name
         self.embedding_model = embedding_model
         self._retriever: Any | None = None
         self._llm: Any | None = None
@@ -67,7 +207,7 @@ class ReviewRAGService:
         return {
             "review_summary": review_summary,
             "knowledge_base_sources": self._collect_sources(retrieved_docs),
-            "llm_model": self.model_name,
+            "llm_model": getattr(self._llm, "model_name", self.model_name),
             "embedding_model": self.embedding_model,
             "retrieval_policy_version": RETRIEVAL_POLICY_VERSION,
             "review_guardrail_applied": guardrail_applied,
@@ -93,7 +233,6 @@ class ReviewRAGService:
         try:
             from langchain_chroma import Chroma
             from langchain_community.document_loaders import PyPDFLoader
-            from langchain_ollama import OllamaEmbeddings, OllamaLLM
             from langchain_text_splitters import RecursiveCharacterTextSplitter
         except ImportError as exc:
             raise RuntimeError(
@@ -131,11 +270,11 @@ class ReviewRAGService:
         if not chunks:
             raise FileNotFoundError("No usable text was found in the PDF knowledge base.")
 
-        collection_name = f"credit_review_{self._knowledge_fingerprint(knowledge_files)}"
+        collection_name = f"credit_review_{self.embedding_model.replace('-', '_')}_{self._knowledge_fingerprint(knowledge_files)}"
         self.vector_store_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            embeddings = OllamaEmbeddings(model=self.embedding_model)
+            embeddings = GeminiEmbeddings(model=self.embedding_model)
             vector_store = Chroma(
                 collection_name=collection_name,
                 persist_directory=str(self.vector_store_dir),
@@ -145,12 +284,16 @@ class ReviewRAGService:
                 vector_store.add_documents(chunks)
         except Exception as exc:
             raise RuntimeError(
-                "Unable to build the policy vector index. "
-                f"Ensure Ollama is running and model '{self.embedding_model}' is installed."
+                "Unable to build the policy vector index with Gemini embeddings. "
+                f"Ensure GEMINI_API_KEY is configured in your .env file. Error: {exc}"
             ) from exc
 
         self._retriever = vector_store.as_retriever(search_kwargs={"k": 4})
-        self._llm = OllamaLLM(model=self.model_name, temperature=0)
+        cascade_models = list(self.model_names)
+        for model in GEMINI_FLASH_CASCADE:
+            if model not in cascade_models:
+                cascade_models.append(model)
+        self._llm = GeminiCascadeLLM(models=cascade_models)
 
     def _get_knowledge_files(self) -> list[Path]:
         if not self.knowledge_base_dir.exists():
@@ -246,9 +389,14 @@ Write only a concise reviewer note, without a preamble, with exactly these headi
     ) -> dict[str, Any]:
         signed_reason = str(prediction_payload.get("decision_reason", ""))
         risk_increasing_factors = self._risk_increasing_factors(prediction_payload)
+        raw_pd = prediction_payload.get("pd")
+        try:
+            pd_val = round(float(raw_pd), 3) if raw_pd is not None else None
+        except (ValueError, TypeError):
+            pd_val = raw_pd
         case_facts = {
             "decision": prediction_payload.get("decision"),
-            "probability_of_default": prediction_payload.get("pd"),
+            "probability_of_default": pd_val,
             "risk_increasing_factors": risk_increasing_factors,
         }
         if "higher credit amount" in signed_reason:
